@@ -48,6 +48,14 @@ export function useChatHistory() {
   const [initialMessages, setInitialMessages] = useState<Message[]>([]);
   const [ready, setReady] = useState<boolean>(false);
   const [urlId, setUrlId] = useState<string | undefined>();
+  /*
+   * FIX (2026-08-04): storeMessageHistory used to only surface save failures via a
+   * toast that disappears after 5 seconds -- exactly the kind of error the user needs
+   * to see until they've acknowledged it, since it affects whether their session
+   * survives a reload. This is returned from the hook and rendered as a persistent
+   * banner in Chat.client.tsx instead.
+   */
+  const [persistenceError, setPersistenceError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!db) {
@@ -264,6 +272,7 @@ ${value.content}
   return {
     ready: !mixedId || ready,
     initialMessages,
+    persistenceError,
     updateChatMestaData: async (metadata: IChatMetadata) => {
       const id = chatId.get();
 
@@ -338,15 +347,23 @@ ${value.content}
         return;
       }
 
-      await setMessages(
-        db,
-        finalChatId, // Use the potentially updated chatId
-        [...archivedMessages, ...messages],
-        urlId,
-        description.get(),
-        undefined,
-        chatMetadata.get(),
-      );
+      try {
+        await setMessages(
+          db,
+          finalChatId, // Use the potentially updated chatId
+          [...archivedMessages, ...messages],
+          urlId,
+          description.get(),
+          undefined,
+          chatMetadata.get(),
+        );
+        setPersistenceError(null);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        setPersistenceError(
+          `No se pudo guardar el historial (${message}). Tu sesión sigue activa pero podría perderse si recargás la página.`,
+        );
+      }
     },
     duplicateCurrentChat: async (listItemId: string) => {
       if (!db || (!mixedId && !listItemId)) {
@@ -385,6 +402,12 @@ ${value.content}
       }
 
       const chat = await getMessages(db, id);
+
+      if (!chat) {
+        toast.error('Chat not found');
+        return;
+      }
+
       const chatData = {
         messages: chat.messages,
         description: chat.description,

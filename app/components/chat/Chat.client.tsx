@@ -34,7 +34,7 @@ const logger = createScopedLogger('Chat');
 export function Chat() {
   renderLogger.trace('Chat');
 
-  const { ready, initialMessages, storeMessageHistory, importChat, exportChat } = useChatHistory();
+  const { ready, initialMessages, storeMessageHistory, importChat, exportChat, persistenceError } = useChatHistory();
   const title = useStore(description);
   useEffect(() => {
     workbenchStore.setReloadedMessages(initialMessages.map((m) => m.id));
@@ -49,10 +49,29 @@ export function Chat() {
           exportChat={exportChat}
           storeMessageHistory={storeMessageHistory}
           importChat={importChat}
+          persistenceError={persistenceError}
         />
       )}
     </>
   );
+}
+
+/*
+ * FIX (2026-08-04): detects a model stuck repeating the same fragment of text
+ * indefinitely (observed in production: DeepSeek emitting a control token like
+ * `<|DSML|>` thousands of times in a row) so the generation can be stopped
+ * automatically instead of growing forever and eventually freezing the tab
+ * trying to render it.
+ */
+function detectRepetitionLoop(content: string): boolean {
+  if (content.length < 300) {
+    return false;
+  }
+
+  const tail = content.slice(-100);
+  const beforeTail = content.slice(-300, -100);
+
+  return beforeTail.includes(tail);
 }
 
 const processSampledMessages = createSampler(
@@ -85,10 +104,11 @@ interface ChatProps {
   importChat: (description: string, messages: Message[]) => Promise<void>;
   exportChat: () => void;
   description?: string;
+  persistenceError?: string | null;
 }
 
 export const ChatImpl = memo(
-  ({ description, initialMessages, storeMessageHistory, importChat, exportChat }: ChatProps) => {
+  ({ description, initialMessages, storeMessageHistory, importChat, exportChat, persistenceError }: ChatProps) => {
     useShortcuts();
 
     const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -310,6 +330,32 @@ export const ChatImpl = memo(
     const clearApiErrorAlert = useCallback(() => {
       setLlmErrorAlert(undefined);
     }, []);
+
+    // FIX (2026-08-04): see detectRepetitionLoop() above -- stop a model stuck
+    // repeating itself instead of letting it run (and grow the tab-freezing
+    // message) until it hits the token limit on its own.
+    useEffect(() => {
+      if (!isLoading) {
+        return;
+      }
+
+      const lastMessage = messages[messages.length - 1];
+
+      if (lastMessage?.role !== 'assistant' || typeof lastMessage.content !== 'string') {
+        return;
+      }
+
+      if (detectRepetitionLoop(lastMessage.content)) {
+        abort();
+        setLlmErrorAlert({
+          type: 'error',
+          title: 'El modelo entró en un bucle',
+          description: 'Se detectó contenido repetitivo. La generación fue detenida automáticamente. Podés reintentar con un prompt diferente.',
+          provider: provider.name,
+          errorType: 'unknown',
+        });
+      }
+    }, [messages, isLoading, provider.name]);
 
     useEffect(() => {
       const textarea = textareaRef.current;
@@ -614,8 +660,32 @@ export const ChatImpl = memo(
       [input, handleInputChange],
     );
 
+    /*
+     * FIX (2026-08-04): persistent, dismissible banner for storeMessageHistory
+     * failures -- separate from the red LLM-error banner (LLMApiAlert) so the
+     * user can tell "your save failed" apart from "the AI failed" at a glance.
+     * Resets its dismissed state whenever a new/different error comes in.
+     */
+    const [persistenceBannerDismissed, setPersistenceBannerDismissed] = useState(false);
+
+    useEffect(() => {
+      setPersistenceBannerDismissed(false);
+    }, [persistenceError]);
+
     return (
-      <BaseChat
+      <>
+        {persistenceError && !persistenceBannerDismissed && (
+          <div className="fixed top-0 left-0 right-0 z-[9999] flex items-center justify-between gap-4 bg-amber-500 px-4 py-2 text-sm text-white shadow-md">
+            <span>{persistenceError}</span>
+            <button
+              onClick={() => setPersistenceBannerDismissed(true)}
+              className="shrink-0 rounded px-2 py-1 underline hover:bg-amber-600"
+            >
+              Cerrar
+            </button>
+          </div>
+        )}
+        <BaseChat
         ref={animationScope}
         textareaRef={textareaRef}
         input={input}
@@ -686,6 +756,7 @@ export const ChatImpl = memo(
         addToolResult={addToolResult}
         onWebSearchResult={handleWebSearchResult}
       />
+      </>
     );
   },
 );

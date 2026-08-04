@@ -70,7 +70,13 @@ const processSampledMessages = createSampler(
       storeMessageHistory(messages).catch((error) => toast.error(error.message));
     }
   },
-  50,
+  /*
+   * FIX (2026-08-04): persistence moved from IndexedDB (main-thread writes on every
+   * sample) to a server API call -- 50ms was already too aggressive for local writes
+   * and is unnecessary network chatter now. 1500ms keeps the UI/history in sync without
+   * saturating the main thread or hammering the API during streaming.
+   */
+  1500,
 );
 
 interface ChatProps {

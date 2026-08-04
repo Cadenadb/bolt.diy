@@ -224,10 +224,14 @@ export async function selectContext(props: {
   const totalFiles = Object.keys(filteredFiles).length;
   logger.info(`Total files: ${totalFiles}`);
 
-  if (totalFiles == 0) {
-    throw new Error(`Bolt failed to select files`);
-  }
-
+  /*
+   * FIX (2026-08-04): this used to throw "Bolt failed to select files" whenever the model
+   * picked zero NEW files -- but zero is a normal, valid outcome (the system prompt itself
+   * tells the model "if no changes are needed, you can leave the response empty", and files
+   * already in the current context buffer are deliberately skipped above). For a message
+   * that doesn't need new file context (a status question, a small follow-up), this threw a
+   * hard "Server Error" instead of just proceeding with an empty selection, breaking the chat.
+   */
   return filteredFiles;
 
   // generateText({

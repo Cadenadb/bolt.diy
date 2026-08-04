@@ -232,25 +232,31 @@ ${value.content}
       return;
     }
 
-    Object.entries(validSnapshot.files).forEach(async ([key, value]) => {
-      if (key.startsWith(container.workdir)) {
-        key = key.replace(container.workdir, '');
+    /*
+     * FIX (2026-08-04): both loops below used to be `Object.entries(...).forEach(async ...)`,
+     * which fires every iteration concurrently without awaiting any of them -- the file-write
+     * loop could (and did) start writing into folders the mkdir loop hadn't created yet,
+     * leaving a floating rejected promise with no .catch and the "Creating initial files"
+     * progress UI stuck forever with no error surfaced. Sequential `for...of` + `await` makes
+     * folders finish before any file write starts, and each write wait its turn.
+     */
+    for (const [key, value] of Object.entries(validSnapshot.files)) {
+      if (value?.type !== 'folder') {
+        continue;
       }
 
-      if (value?.type === 'folder') {
-        await container.fs.mkdir(key, { recursive: true });
-      }
-    });
-    Object.entries(validSnapshot.files).forEach(async ([key, value]) => {
-      if (value?.type === 'file') {
-        if (key.startsWith(container.workdir)) {
-          key = key.replace(container.workdir, '');
-        }
+      const relPath = key.startsWith(container.workdir) ? key.replace(container.workdir, '') : key;
+      await container.fs.mkdir(relPath, { recursive: true });
+    }
 
-        await container.fs.writeFile(key, value.content, { encoding: value.isBinary ? undefined : 'utf8' });
-      } else {
+    for (const [key, value] of Object.entries(validSnapshot.files)) {
+      if (value?.type !== 'file') {
+        continue;
       }
-    });
+
+      const relPath = key.startsWith(container.workdir) ? key.replace(container.workdir, '') : key;
+      await container.fs.writeFile(relPath, value.content, { encoding: value.isBinary ? undefined : 'utf8' });
+    }
 
     // workbenchStore.files.setKey(snapshot?.files)
   }, []);

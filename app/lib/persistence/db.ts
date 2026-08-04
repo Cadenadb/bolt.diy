@@ -11,59 +11,44 @@ export interface IChatMetadata {
 
 const logger = createScopedLogger('ChatHistory');
 
+/*
+ * FIX (2026-08-04): persistence moved from browser IndexedDB to server-side Postgres
+ * (via these /api/chats* and /api/snapshots* routes -> bolt-diy-persistence ->
+ * bolt-diy-db). Large projects were freezing the tab because every sampled message
+ * chunk re-serialized and wrote the full history + file snapshot to IndexedDB on the
+ * main thread. `Db` below is a lightweight truthy sentinel, not a real IDBDatabase --
+ * kept only so callers' `if (!db)` checks keep working unchanged.
+ */
+type Db = Record<string, never>;
+
 // this is used at the top level and never rejects
-export async function openDatabase(): Promise<IDBDatabase | undefined> {
-  if (typeof indexedDB === 'undefined') {
-    console.error('indexedDB is not available in this environment.');
+export async function openDatabase(): Promise<Db | undefined> {
+  try {
+    const response = await fetch('/api/chats');
+
+    if (!response.ok) {
+      throw new Error(`status ${response.status}`);
+    }
+
+    return {};
+  } catch (error) {
+    logger.error('Chat persistence API is not reachable', error);
     return undefined;
   }
-
-  return new Promise((resolve) => {
-    const request = indexedDB.open('boltHistory', 2);
-
-    request.onupgradeneeded = (event: IDBVersionChangeEvent) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      const oldVersion = event.oldVersion;
-
-      if (oldVersion < 1) {
-        if (!db.objectStoreNames.contains('chats')) {
-          const store = db.createObjectStore('chats', { keyPath: 'id' });
-          store.createIndex('id', 'id', { unique: true });
-          store.createIndex('urlId', 'urlId', { unique: true });
-        }
-      }
-
-      if (oldVersion < 2) {
-        if (!db.objectStoreNames.contains('snapshots')) {
-          db.createObjectStore('snapshots', { keyPath: 'chatId' });
-        }
-      }
-    };
-
-    request.onsuccess = (event: Event) => {
-      resolve((event.target as IDBOpenDBRequest).result);
-    };
-
-    request.onerror = (event: Event) => {
-      resolve(undefined);
-      logger.error((event.target as IDBOpenDBRequest).error);
-    };
-  });
 }
 
-export async function getAll(db: IDBDatabase): Promise<ChatHistoryItem[]> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('chats', 'readonly');
-    const store = transaction.objectStore('chats');
-    const request = store.getAll();
+export async function getAll(_db: Db): Promise<ChatHistoryItem[]> {
+  const response = await fetch('/api/chats');
 
-    request.onsuccess = () => resolve(request.result as ChatHistoryItem[]);
-    request.onerror = () => reject(request.error);
-  });
+  if (!response.ok) {
+    throw new Error(`Failed to list chats: ${response.status}`);
+  }
+
+  return response.json();
 }
 
 export async function setMessages(
-  db: IDBDatabase,
+  _db: Db,
   id: string,
   messages: Message[],
   urlId?: string,
@@ -71,158 +56,80 @@ export async function setMessages(
   timestamp?: string,
   metadata?: IChatMetadata,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('chats', 'readwrite');
-    const store = transaction.objectStore('chats');
+  if (timestamp && isNaN(Date.parse(timestamp))) {
+    throw new Error('Invalid timestamp');
+  }
 
-    if (timestamp && isNaN(Date.parse(timestamp))) {
-      reject(new Error('Invalid timestamp'));
-      return;
-    }
-
-    const request = store.put({
-      id,
-      messages,
-      urlId,
-      description,
-      timestamp: timestamp ?? new Date().toISOString(),
-      metadata,
-    });
-
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
+  const response = await fetch(`/api/chats/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, urlId, description, timestamp, metadata }),
   });
-}
 
-export async function getMessages(db: IDBDatabase, id: string): Promise<ChatHistoryItem> {
-  return (await getMessagesById(db, id)) || (await getMessagesByUrlId(db, id));
-}
-
-export async function getMessagesByUrlId(db: IDBDatabase, id: string): Promise<ChatHistoryItem> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('chats', 'readonly');
-    const store = transaction.objectStore('chats');
-    const index = store.index('urlId');
-    const request = index.get(id);
-
-    request.onsuccess = () => resolve(request.result as ChatHistoryItem);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-export async function getMessagesById(db: IDBDatabase, id: string): Promise<ChatHistoryItem> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('chats', 'readonly');
-    const store = transaction.objectStore('chats');
-    const request = store.get(id);
-
-    request.onsuccess = () => resolve(request.result as ChatHistoryItem);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-export async function deleteById(db: IDBDatabase, id: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(['chats', 'snapshots'], 'readwrite'); // Add snapshots store to transaction
-    const chatStore = transaction.objectStore('chats');
-    const snapshotStore = transaction.objectStore('snapshots');
-
-    const deleteChatRequest = chatStore.delete(id);
-    const deleteSnapshotRequest = snapshotStore.delete(id); // Also delete snapshot
-
-    let chatDeleted = false;
-    let snapshotDeleted = false;
-
-    const checkCompletion = () => {
-      if (chatDeleted && snapshotDeleted) {
-        resolve(undefined);
-      }
-    };
-
-    deleteChatRequest.onsuccess = () => {
-      chatDeleted = true;
-      checkCompletion();
-    };
-    deleteChatRequest.onerror = () => reject(deleteChatRequest.error);
-
-    deleteSnapshotRequest.onsuccess = () => {
-      snapshotDeleted = true;
-      checkCompletion();
-    };
-
-    deleteSnapshotRequest.onerror = (event) => {
-      if ((event.target as IDBRequest).error?.name === 'NotFoundError') {
-        snapshotDeleted = true;
-        checkCompletion();
-      } else {
-        reject(deleteSnapshotRequest.error);
-      }
-    };
-
-    transaction.oncomplete = () => {
-      // This might resolve before checkCompletion if one operation finishes much faster
-    };
-    transaction.onerror = () => reject(transaction.error);
-  });
-}
-
-export async function getNextId(db: IDBDatabase): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('chats', 'readonly');
-    const store = transaction.objectStore('chats');
-    const request = store.getAllKeys();
-
-    request.onsuccess = () => {
-      const highestId = request.result.reduce((cur, acc) => Math.max(+cur, +acc), 0);
-      resolve(String(+highestId + 1));
-    };
-
-    request.onerror = () => reject(request.error);
-  });
-}
-
-export async function getUrlId(db: IDBDatabase, id: string): Promise<string> {
-  const idList = await getUrlIds(db);
-
-  if (!idList.includes(id)) {
-    return id;
-  } else {
-    let i = 2;
-
-    while (idList.includes(`${id}-${i}`)) {
-      i++;
-    }
-
-    return `${id}-${i}`;
+  if (!response.ok) {
+    throw new Error(`Failed to save chat: ${response.status}`);
   }
 }
 
-async function getUrlIds(db: IDBDatabase): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('chats', 'readonly');
-    const store = transaction.objectStore('chats');
-    const idList: string[] = [];
+async function fetchChat(id: string, mode: 'id' | 'urlId' | 'either'): Promise<ChatHistoryItem | undefined> {
+  const response = await fetch(`/api/chats/${encodeURIComponent(id)}?mode=${mode}`);
 
-    const request = store.openCursor();
+  if (response.status === 404) {
+    return undefined;
+  }
 
-    request.onsuccess = (event: Event) => {
-      const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
+  if (!response.ok) {
+    throw new Error(`Failed to load chat: ${response.status}`);
+  }
 
-      if (cursor) {
-        idList.push(cursor.value.urlId);
-        cursor.continue();
-      } else {
-        resolve(idList);
-      }
-    };
-
-    request.onerror = () => {
-      reject(request.error);
-    };
-  });
+  return response.json();
 }
 
-export async function forkChat(db: IDBDatabase, chatId: string, messageId: string): Promise<string> {
+export async function getMessages(_db: Db, id: string): Promise<ChatHistoryItem> {
+  return (await fetchChat(id, 'either')) as ChatHistoryItem;
+}
+
+export async function getMessagesByUrlId(_db: Db, id: string): Promise<ChatHistoryItem> {
+  return (await fetchChat(id, 'urlId')) as ChatHistoryItem;
+}
+
+export async function getMessagesById(_db: Db, id: string): Promise<ChatHistoryItem> {
+  return (await fetchChat(id, 'id')) as ChatHistoryItem;
+}
+
+export async function deleteById(_db: Db, id: string): Promise<void> {
+  const response = await fetch(`/api/chats/${encodeURIComponent(id)}`, { method: 'DELETE' });
+
+  if (!response.ok) {
+    throw new Error(`Failed to delete chat: ${response.status}`);
+  }
+}
+
+export async function getNextId(_db: Db): Promise<string> {
+  const response = await fetch('/api/chats/meta/next-id');
+
+  if (!response.ok) {
+    throw new Error(`Failed to get next id: ${response.status}`);
+  }
+
+  const { nextId } = (await response.json()) as { nextId: string };
+
+  return nextId;
+}
+
+export async function getUrlId(_db: Db, id: string): Promise<string> {
+  const response = await fetch(`/api/chats/meta/next-url-id?base=${encodeURIComponent(id)}`);
+
+  if (!response.ok) {
+    throw new Error(`Failed to get url id: ${response.status}`);
+  }
+
+  const { urlId } = (await response.json()) as { urlId: string };
+
+  return urlId;
+}
+
+export async function forkChat(db: Db, chatId: string, messageId: string): Promise<string> {
   const chat = await getMessages(db, chatId);
 
   if (!chat) {
@@ -242,7 +149,7 @@ export async function forkChat(db: IDBDatabase, chatId: string, messageId: strin
   return createChatFromMessages(db, chat.description ? `${chat.description} (fork)` : 'Forked chat', messages);
 }
 
-export async function duplicateChat(db: IDBDatabase, id: string): Promise<string> {
+export async function duplicateChat(db: Db, id: string): Promise<string> {
   const chat = await getMessages(db, id);
 
   if (!chat) {
@@ -253,7 +160,7 @@ export async function duplicateChat(db: IDBDatabase, id: string): Promise<string
 }
 
 export async function createChatFromMessages(
-  db: IDBDatabase,
+  db: Db,
   description: string,
   messages: Message[],
   metadata?: IChatMetadata,
@@ -274,7 +181,7 @@ export async function createChatFromMessages(
   return newUrlId; // Return the urlId instead of id for navigation
 }
 
-export async function updateChatDescription(db: IDBDatabase, id: string, description: string): Promise<void> {
+export async function updateChatDescription(db: Db, id: string, description: string): Promise<void> {
   const chat = await getMessages(db, id);
 
   if (!chat) {
@@ -288,11 +195,7 @@ export async function updateChatDescription(db: IDBDatabase, id: string, descrip
   await setMessages(db, id, chat.messages, chat.urlId, description, chat.timestamp, chat.metadata);
 }
 
-export async function updateChatMetadata(
-  db: IDBDatabase,
-  id: string,
-  metadata: IChatMetadata | undefined,
-): Promise<void> {
+export async function updateChatMetadata(db: Db, id: string, metadata: IChatMetadata | undefined): Promise<void> {
   const chat = await getMessages(db, id);
 
   if (!chat) {
@@ -302,42 +205,34 @@ export async function updateChatMetadata(
   await setMessages(db, id, chat.messages, chat.urlId, chat.description, chat.timestamp, metadata);
 }
 
-export async function getSnapshot(db: IDBDatabase, chatId: string): Promise<Snapshot | undefined> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('snapshots', 'readonly');
-    const store = transaction.objectStore('snapshots');
-    const request = store.get(chatId);
+export async function getSnapshot(_db: Db, chatId: string): Promise<Snapshot | undefined> {
+  const response = await fetch(`/api/snapshots/${encodeURIComponent(chatId)}`);
 
-    request.onsuccess = () => resolve(request.result?.snapshot as Snapshot | undefined);
-    request.onerror = () => reject(request.error);
-  });
+  if (!response.ok) {
+    throw new Error(`Failed to get snapshot: ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  return (data ?? undefined) as Snapshot | undefined;
 }
 
-export async function setSnapshot(db: IDBDatabase, chatId: string, snapshot: Snapshot): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('snapshots', 'readwrite');
-    const store = transaction.objectStore('snapshots');
-    const request = store.put({ chatId, snapshot });
-
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
+export async function setSnapshot(_db: Db, chatId: string, snapshot: Snapshot): Promise<void> {
+  const response = await fetch(`/api/snapshots/${encodeURIComponent(chatId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(snapshot),
   });
+
+  if (!response.ok) {
+    throw new Error(`Failed to save snapshot: ${response.status}`);
+  }
 }
 
-export async function deleteSnapshot(db: IDBDatabase, chatId: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('snapshots', 'readwrite');
-    const store = transaction.objectStore('snapshots');
-    const request = store.delete(chatId);
+export async function deleteSnapshot(_db: Db, chatId: string): Promise<void> {
+  const response = await fetch(`/api/snapshots/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
 
-    request.onsuccess = () => resolve();
-
-    request.onerror = (event) => {
-      if ((event.target as IDBRequest).error?.name === 'NotFoundError') {
-        resolve();
-      } else {
-        reject(request.error);
-      }
-    };
-  });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`Failed to delete snapshot: ${response.status}`);
+  }
 }

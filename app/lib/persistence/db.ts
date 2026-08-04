@@ -21,6 +21,27 @@ const logger = createScopedLogger('ChatHistory');
  */
 type Db = Record<string, never>;
 
+/*
+ * FIX (2026-08-04): none of the fetch calls below had a timeout -- if the
+ * persistence service hung or the network stalled, the promise could stay
+ * pending indefinitely, leaving the UI spinner stuck with no error ever
+ * surfaced. AbortController enforces an upper bound on every request.
+ */
+async function fetchWithTimeout(url: string, options?: RequestInit, ms = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ms);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // this is used at the top level and never rejects
 export async function openDatabase(): Promise<Db | undefined> {
   if (typeof window === 'undefined') {
@@ -31,7 +52,7 @@ export async function openDatabase(): Promise<Db | undefined> {
   }
 
   try {
-    const response = await fetch('/api/chats');
+    const response = await fetchWithTimeout('/api/chats');
 
     if (!response.ok) {
       throw new Error(`status ${response.status}`);
@@ -45,7 +66,7 @@ export async function openDatabase(): Promise<Db | undefined> {
 }
 
 export async function getAll(_db: Db): Promise<ChatHistoryItem[]> {
-  const response = await fetch('/api/chats');
+  const response = await fetchWithTimeout('/api/chats');
 
   if (!response.ok) {
     throw new Error(`Failed to list chats: ${response.status}`);
@@ -54,6 +75,13 @@ export async function getAll(_db: Db): Promise<ChatHistoryItem[]> {
   return response.json();
 }
 
+/*
+ * FIX (2026-08-04): this is called on every sampled message chunk while the AI
+ * streams a response -- a transient network hiccup or a persistence-service
+ * restart used to fail the save on the first try with no recovery. Retrying a
+ * couple of times with backoff absorbs short-lived failures instead of
+ * surfacing them to the user immediately.
+ */
 export async function setMessages(
   _db: Db,
   id: string,
@@ -67,19 +95,37 @@ export async function setMessages(
     throw new Error('Invalid timestamp');
   }
 
-  const response = await fetch(`/api/chats/${encodeURIComponent(id)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, urlId, description, timestamp, metadata }),
-  });
+  const body = JSON.stringify({ messages, urlId, description, timestamp, metadata });
+  const maxAttempts = 3;
+  const backoffsMs = [500, 1500];
 
-  if (!response.ok) {
-    throw new Error(`Failed to save chat: ${response.status}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetchWithTimeout(`/api/chats/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+
+      if (response.ok) {
+        return;
+      }
+
+      if (response.status < 500 || attempt === maxAttempts) {
+        throw new Error(`Failed to save chat: ${response.status}`);
+      }
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        throw error instanceof Error ? error : new Error('Failed to save chat: network error');
+      }
+    }
+
+    await sleep(backoffsMs[attempt - 1]);
   }
 }
 
 async function fetchChat(id: string, mode: 'id' | 'urlId' | 'either'): Promise<ChatHistoryItem | undefined> {
-  const response = await fetch(`/api/chats/${encodeURIComponent(id)}?mode=${mode}`);
+  const response = await fetchWithTimeout(`/api/chats/${encodeURIComponent(id)}?mode=${mode}`);
 
   if (response.status === 404) {
     return undefined;
@@ -92,20 +138,22 @@ async function fetchChat(id: string, mode: 'id' | 'urlId' | 'either'): Promise<C
   return response.json();
 }
 
-export async function getMessages(_db: Db, id: string): Promise<ChatHistoryItem> {
-  return (await fetchChat(id, 'either')) as ChatHistoryItem;
+// FIX (2026-08-04): returns `undefined` explicitly instead of an unsafe cast, so
+// TypeScript forces every caller to handle the "chat not found" case.
+export async function getMessages(_db: Db, id: string): Promise<ChatHistoryItem | undefined> {
+  return fetchChat(id, 'either');
 }
 
-export async function getMessagesByUrlId(_db: Db, id: string): Promise<ChatHistoryItem> {
-  return (await fetchChat(id, 'urlId')) as ChatHistoryItem;
+export async function getMessagesByUrlId(_db: Db, id: string): Promise<ChatHistoryItem | undefined> {
+  return fetchChat(id, 'urlId');
 }
 
-export async function getMessagesById(_db: Db, id: string): Promise<ChatHistoryItem> {
-  return (await fetchChat(id, 'id')) as ChatHistoryItem;
+export async function getMessagesById(_db: Db, id: string): Promise<ChatHistoryItem | undefined> {
+  return fetchChat(id, 'id');
 }
 
 export async function deleteById(_db: Db, id: string): Promise<void> {
-  const response = await fetch(`/api/chats/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  const response = await fetchWithTimeout(`/api/chats/${encodeURIComponent(id)}`, { method: 'DELETE' });
 
   if (!response.ok) {
     throw new Error(`Failed to delete chat: ${response.status}`);
@@ -113,7 +161,7 @@ export async function deleteById(_db: Db, id: string): Promise<void> {
 }
 
 export async function getNextId(_db: Db): Promise<string> {
-  const response = await fetch('/api/chats/meta/next-id');
+  const response = await fetchWithTimeout('/api/chats/meta/next-id');
 
   if (!response.ok) {
     throw new Error(`Failed to get next id: ${response.status}`);
@@ -125,7 +173,7 @@ export async function getNextId(_db: Db): Promise<string> {
 }
 
 export async function getUrlId(_db: Db, id: string): Promise<string> {
-  const response = await fetch(`/api/chats/meta/next-url-id?base=${encodeURIComponent(id)}`);
+  const response = await fetchWithTimeout(`/api/chats/meta/next-url-id?base=${encodeURIComponent(id)}`);
 
   if (!response.ok) {
     throw new Error(`Failed to get url id: ${response.status}`);
@@ -213,7 +261,7 @@ export async function updateChatMetadata(db: Db, id: string, metadata: IChatMeta
 }
 
 export async function getSnapshot(_db: Db, chatId: string): Promise<Snapshot | undefined> {
-  const response = await fetch(`/api/snapshots/${encodeURIComponent(chatId)}`);
+  const response = await fetchWithTimeout(`/api/snapshots/${encodeURIComponent(chatId)}`);
 
   if (!response.ok) {
     throw new Error(`Failed to get snapshot: ${response.status}`);
@@ -225,7 +273,7 @@ export async function getSnapshot(_db: Db, chatId: string): Promise<Snapshot | u
 }
 
 export async function setSnapshot(_db: Db, chatId: string, snapshot: Snapshot): Promise<void> {
-  const response = await fetch(`/api/snapshots/${encodeURIComponent(chatId)}`, {
+  const response = await fetchWithTimeout(`/api/snapshots/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(snapshot),
@@ -237,7 +285,7 @@ export async function setSnapshot(_db: Db, chatId: string, snapshot: Snapshot): 
 }
 
 export async function deleteSnapshot(_db: Db, chatId: string): Promise<void> {
-  const response = await fetch(`/api/snapshots/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+  const response = await fetchWithTimeout(`/api/snapshots/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
 
   if (!response.ok && response.status !== 404) {
     throw new Error(`Failed to delete snapshot: ${response.status}`);

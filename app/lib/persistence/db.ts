@@ -23,6 +23,13 @@ type Db = Record<string, never>;
 
 // this is used at the top level and never rejects
 export async function openDatabase(): Promise<Db | undefined> {
+  if (typeof window === 'undefined') {
+    // SSR: matches the original `typeof indexedDB === 'undefined'` guard -- this
+    // module's top-level `await openDatabase()` still runs during server render,
+    // and a relative fetch('/api/chats') has no origin to resolve against there.
+    return undefined;
+  }
+
   try {
     const response = await fetch('/api/chats');
 

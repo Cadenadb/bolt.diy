@@ -5,6 +5,7 @@ import { memo, useEffect, useRef, useState } from 'react';
 import { createHighlighter, type BundledLanguage, type BundledTheme, type HighlighterGeneric } from 'shiki';
 import type { ActionState } from '~/lib/runtime/action-runner';
 import { workbenchStore } from '~/lib/stores/workbench';
+import { streamingState } from '~/lib/stores/streaming';
 import { classNames } from '~/utils/classNames';
 import { cubicEasingFn } from '~/utils/easings';
 import { WORK_DIR } from '~/utils/constants';
@@ -203,12 +204,28 @@ export function openArtifactInWorkbench(filePath: any) {
 }
 
 const ActionList = memo(({ actions }: ActionListProps) => {
+  /*
+   * FIX (2026-08-05): a 'file' action can end up stuck at 'pending'/'running' in
+   * the store forever -- e.g. a response interrupted mid-file, or a snapshot
+   * restore that hydrates actions without ever driving them to 'complete'. We
+   * tried aborting those in the store (useMessageParser.ts / action-runner.ts),
+   * but couldn't pin down every code path that creates actions this way, so the
+   * spinner kept surviving. This fixes it at the only place that actually
+   * matters: never render a spinner for a 'file' action once nothing is
+   * genuinely streaming, regardless of what its stored status says. 'start'/
+   * 'shell' are excluded -- those can legitimately keep running long after the
+   * text stream ends (e.g. a real in-progress `npm install`).
+   */
+  const isStreaming = useStore(streamingState);
+
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
       <ul className="list-none space-y-2.5">
         {actions.map((action, index) => {
-          const { status, type, content } = action;
+          const { type, content } = action;
           const isLast = index === actions.length - 1;
+          const isStuck = !isStreaming && type === 'file' && (action.status === 'pending' || action.status === 'running');
+          const status = isStuck ? 'aborted' : action.status;
 
           return (
             <motion.li
@@ -222,7 +239,7 @@ const ActionList = memo(({ actions }: ActionListProps) => {
               }}
             >
               <div className="flex items-center gap-1.5 text-sm">
-                <div className={classNames('text-lg', getIconColor(action.status))}>
+                <div className={classNames('text-lg', getIconColor(status))}>
                   {status === 'running' ? (
                     <>
                       {type !== 'start' ? (

@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react';
 import type { Message } from 'ai';
 import { useChat } from '@ai-sdk/react';
 import { useAnimate } from 'framer-motion';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, startTransition, useState } from 'react';
 import { toast } from 'react-toastify';
 import { useMessageParser, usePromptEnhancer, useShortcuts } from '~/lib/hooks';
 import { description, useChatHistory } from '~/lib/persistence';
@@ -87,7 +87,34 @@ const processSampledMessages = createSampler(
     parseMessages(messages, isLoading);
 
     if (messages.length > initialMessages.length) {
-      storeMessageHistory(messages).catch((error) => toast.error(error.message));
+      /*
+       * FIX (2026-08-04): defer the save off the current task so it never competes with
+       * rendering for the main thread. requestIdleCallback runs it when the browser is
+       * idle between frames; setTimeout(0) is the fallback for browsers without it.
+       * Adapted from stackblitz-labs/bolt.diy PR #2156.
+       */
+      const saveHistory = () => {
+        storeMessageHistory(messages).catch((error) => {
+          // Network/resource-exhaustion errors aren't actionable by the user and
+          // flood the screen with toasts when the browser is under memory pressure
+          // (exactly what happens during a heavy npm install) -- log instead.
+          const msg: string = error?.message ?? '';
+          const isResourceError =
+            msg.includes('Failed to fetch') || msg.includes('ERR_INSUFFICIENT') || msg.includes('NetworkError');
+
+          if (!isResourceError) {
+            toast.error(msg);
+          } else {
+            console.warn('Chat history save failed (resource pressure):', msg);
+          }
+        });
+      };
+
+      if (typeof requestIdleCallback !== 'undefined') {
+        requestIdleCallback(saveHistory, { timeout: 2000 });
+      } else {
+        setTimeout(saveHistory, 0);
+      }
     }
   },
   /*
@@ -203,6 +230,51 @@ export const ChatImpl = memo(
         }
 
         logger.debug('Finished streaming');
+
+        /*
+         * FIX (2026-08-04): while the Prompt Queue is running unattended, strip the
+         * <boltArtifact> content out of all but the 2 most recent assistant messages
+         * (keeping a short marker instead). A long automated run otherwise keeps every
+         * generated file in the conversation forever, ballooning the context sent on
+         * every subsequent turn -- exactly what made chat "1" (AprWebs, 737KB+) slow
+         * and eventually hit the empty-context-selection error earlier today.
+         * Wrapped in startTransition so this doesn't compete with rendering for the
+         * main thread. Adapted from stackblitz-labs/bolt.diy PR #2156.
+         */
+        const { isRunning: queueIsRunning } = promptQueueStore.get();
+
+        if (queueIsRunning) {
+          startTransition(() => {
+            setMessages((prev) => {
+              const assistantMsgs = prev.filter((m) => m.role === 'assistant');
+              const keepRecent = 2;
+              const pruneCount = Math.max(0, assistantMsgs.length - keepRecent);
+
+              if (pruneCount === 0) {
+                return prev;
+              }
+
+              let pruned = 0;
+
+              return prev.map((m) => {
+                if (m.role !== 'assistant' || pruned >= pruneCount) {
+                  return m;
+                }
+
+                if (typeof m.content === 'string' && m.content.includes('<boltArtifact')) {
+                  pruned++;
+
+                  return {
+                    ...m,
+                    content: m.content.replace(/<boltArtifact[\s\S]*?<\/boltArtifact>/g, '[files applied to WebContainer]'),
+                  };
+                }
+
+                return m;
+              });
+            });
+          });
+        }
 
         /*
          * FIX (2026-08-04): Prompt Queue -- adapted from stackblitz-labs/bolt.diy PR #2156.

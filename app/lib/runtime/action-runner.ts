@@ -107,7 +107,15 @@ export class ActionRunner {
       executed: false,
       abort: () => {
         abortController.abort();
-        this.#updateAction(actionId, { status: 'aborted' });
+
+        /*
+         * FIX (2026-08-05): mark executed too, not just status. runAction() only
+         * skips re-queuing an action when `executed` is true -- without it, a
+         * later onActionStream re-parse of the same (still-unclosed) text keeps
+         * calling runAction again, which queues another #executeAction that
+         * unconditionally flips status back to 'running', undoing the abort.
+         */
+        this.#updateAction(actionId, { status: 'aborted', executed: true });
       },
       abortSignal: abortController.signal,
     });
@@ -150,6 +158,16 @@ export class ActionRunner {
 
   async #executeAction(actionId: string, isStreaming: boolean = false) {
     const action = this.actions.get()[actionId];
+
+    /*
+     * FIX (2026-08-05): this runs from a queued microtask (runAction chains it
+     * onto #currentExecutionPromise), so it can execute *after* abort() already
+     * marked the action 'aborted'. Without this guard it always overwrites that
+     * with 'running', regardless of how much earlier the abort happened.
+     */
+    if (action.abortSignal.aborted) {
+      return;
+    }
 
     this.#updateAction(actionId, { status: 'running' });
 

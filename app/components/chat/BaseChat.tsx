@@ -30,6 +30,7 @@ import { expoUrlAtom } from '~/lib/stores/qrCodeStore';
 import { useStore } from '@nanostores/react';
 import { StickToBottom, useStickToBottomContext } from '~/lib/hooks';
 import { ChatBox } from './ChatBox';
+import { PromptQueuePanel } from './PromptQueuePanel';
 import type { DesignScheme } from '~/types/design-scheme';
 import type { ElementInfo } from '~/components/workbench/Inspector';
 import LlmErrorAlert from './LLMApiAlert';
@@ -469,6 +470,10 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                   setSelectedElement={setSelectedElement}
                   onWebSearchResult={onWebSearchResult}
                 />
+                {/* FIX (2026-08-04): Prompt Queue -- adapted from stackblitz-labs/bolt.diy PR #2156.
+                    Lets the user queue several prompts (e.g. build phases) and run them
+                    unattended, instead of retyping "continue" after every response. */}
+                {chatStarted && <PromptQueuePanel isStreaming={isStreaming} />}
               </div>
             </StickToBottom>
             <div className="flex flex-col justify-center">

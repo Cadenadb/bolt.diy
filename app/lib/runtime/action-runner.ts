@@ -267,10 +267,36 @@ export class ActionRunner {
       action.content = validationResult.modifiedCommand;
     }
 
-    const resp = await shell.executeCommand(this.runnerId.get(), action.content, () => {
+    /*
+     * FIX (2026-08-04): hard timeout -- prevents shell commands from hanging bolt
+     * indefinitely. A stuck `npm install` or a WebContainer init issue could
+     * otherwise stall the action forever with no way to recover except reloading
+     * the whole page. 90s is generous for a normal install; long-running dev
+     * servers use the 'start' action type below, which is intentionally NOT
+     * subject to this timeout. Adapted from stackblitz-labs/bolt.diy PR #2156.
+     */
+    const SHELL_TIMEOUT_MS = 90_000;
+
+    const execPromise = shell.executeCommand(this.runnerId.get(), action.content, () => {
       logger.debug(`[${action.type}]:Aborting Action\n\n`, action);
       action.abort();
     });
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new ActionCommandError(
+              'Shell command timed out',
+              `Command did not complete within ${SHELL_TIMEOUT_MS / 1000}s:\n${action.content}`,
+            ),
+          ),
+        SHELL_TIMEOUT_MS,
+      ),
+    );
+
+    const resp = await Promise.race([execPromise, timeoutPromise]);
+
     logger.debug(`${action.type} Shell Response: [exit code:${resp?.exitCode}]`);
 
     if (resp?.exitCode != 0) {

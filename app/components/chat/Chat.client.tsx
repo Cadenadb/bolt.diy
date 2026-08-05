@@ -28,6 +28,7 @@ import type { ElementInfo } from '~/components/workbench/Inspector';
 import type { TextUIPart, FileUIPart, Attachment } from '@ai-sdk/ui-utils';
 import { useMCPStore } from '~/lib/stores/mcp';
 import type { LlmErrorAlertType } from '~/types/actions';
+import { promptQueueStore, advanceQueue, clearPendingPrompt, stopQueue } from '~/lib/stores/promptQueue';
 
 const logger = createScopedLogger('Chat');
 
@@ -180,6 +181,10 @@ export const ChatImpl = memo(
       onError: (e) => {
         setFakeLoading(false);
         handleError(e, 'chat');
+
+        // FIX (2026-08-04): a real error must not leave the Prompt Queue silently
+        // "running" forever with nothing left to advance it.
+        stopQueue();
       },
       onFinish: (message, response) => {
         const usage = response.usage;
@@ -198,6 +203,46 @@ export const ChatImpl = memo(
         }
 
         logger.debug('Finished streaming');
+
+        /*
+         * FIX (2026-08-04): Prompt Queue -- adapted from stackblitz-labs/bolt.diy PR #2156.
+         * If a queue is running, advance to the next prompt and fire it automatically
+         * once the workbench settles (all file writes / shell commands reach a terminal
+         * state), instead of requiring the user to retype "continue" after every response.
+         * The settle-wait has a hard 60s ceiling so the queue can never stall forever
+         * waiting on a WebContainer action that never finishes.
+         */
+        const nextPrompt = advanceQueue();
+
+        if (nextPrompt) {
+          const waitForActionsToSettle = (maxWaitMs = 60_000): Promise<void> =>
+            new Promise((resolve) => {
+              const deadline = Date.now() + maxWaitMs;
+
+              const check = () => {
+                const artifacts = workbenchStore.artifacts.get();
+                const anyBusy = Object.values(artifacts).some((artifact) =>
+                  Object.values(artifact.runner.actions.get()).some(
+                    (action) => action.status === 'running' || action.status === 'pending',
+                  ),
+                );
+
+                if (!anyBusy || Date.now() >= deadline) {
+                  // Extra breathing room after actions settle so WebContainer can flush I/O
+                  setTimeout(resolve, 1500);
+                } else {
+                  setTimeout(check, 500);
+                }
+              };
+
+              // Give the action runner a moment to start before we start polling
+              setTimeout(check, 1000);
+            });
+
+          waitForActionsToSettle().then(() => {
+            promptQueueStore.setKey('pendingPrompt', nextPrompt);
+          });
+        }
       },
       initialMessages,
       initialInput: Cookies.get(PROMPT_COOKIE_KEY) || '',
@@ -225,6 +270,24 @@ export const ChatImpl = memo(
     useEffect(() => {
       chatStore.setKey('started', initialMessages.length > 0);
     }, []);
+
+    /*
+     * FIX (2026-08-04): Prompt Queue -- fire the next queued prompt whenever the store
+     * signals one is ready (set by onFinish above once the workbench has settled).
+     * Reuses the exact same [Model: ...][Provider: ...] prefix as a normal manual send.
+     */
+    useEffect(() => {
+      const unsubscribe = promptQueueStore.subscribe((state) => {
+        if (state.pendingPrompt) {
+          clearPendingPrompt();
+
+          const messageText = `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${state.pendingPrompt}`;
+          append({ role: 'user', content: messageText });
+        }
+      });
+
+      return unsubscribe;
+    }, [append, model, provider]);
 
     useEffect(() => {
       processSampledMessages({
@@ -347,6 +410,11 @@ export const ChatImpl = memo(
 
       if (detectRepetitionLoop(lastMessage.content)) {
         abort();
+
+        // FIX (2026-08-04): abort() does not trigger onFinish/onError, so without this
+        // the Prompt Queue would stay "running" forever with nothing left to advance it.
+        stopQueue();
+
         setLlmErrorAlert({
           type: 'error',
           title: 'El modelo entró en un bucle',

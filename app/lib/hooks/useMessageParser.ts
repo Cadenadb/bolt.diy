@@ -74,6 +74,27 @@ export function useMessageParser() {
         }));
       }
     }
+
+    /*
+     * FIX (2026-08-05): a response that gets interrupted mid-file (hits a token
+     * limit, connection drops, tab freezes) leaves its `<boltAction>` tag
+     * unclosed -- onActionClose never fires, so the file action is stuck at
+     * 'running' forever and spins in the UI even though nothing is executing.
+     * Once generation is confirmed over (`!isLoading`), any file action still
+     * pending/running can never receive its close event, so mark it aborted.
+     * Scoped to type 'file' only: shell/start actions can legitimately keep
+     * running well after the text stream ends (e.g. a long `npm install`), and
+     * aborting those here would kill real, still-in-progress work.
+     */
+    if (!isLoading) {
+      for (const artifact of Object.values(workbenchStore.artifacts.get())) {
+        for (const action of Object.values(artifact.runner.actions.get())) {
+          if (action.type === 'file' && (action.status === 'pending' || action.status === 'running')) {
+            action.abort();
+          }
+        }
+      }
+    }
   }, []);
 
   return { parsedMessages, parseMessages };
